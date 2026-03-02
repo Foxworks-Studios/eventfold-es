@@ -1,7 +1,7 @@
 //! Live subscription configuration and runtime types.
 //!
-//! This module provides [`LiveConfig`] for tuning checkpoint and reconnection
-//! behaviour of the live subscription loop, and [`LiveHandle`] for controlling
+//! This module provides [`LiveConfig`] for tuning reconnection behaviour
+//! of the live subscription loop, and [`LiveHandle`] for controlling
 //! a running live subscription.
 
 use std::io;
@@ -19,9 +19,8 @@ use crate::store::AggregateStore;
 
 /// Configuration for live subscription behaviour.
 ///
-/// Controls how often checkpoints are flushed to disk and how the live loop
-/// reconnects after a stream disconnection. All fields have sensible defaults
-/// accessible via [`LiveConfig::default()`].
+/// Controls how the live loop reconnects after a stream disconnection.
+/// All fields have sensible defaults accessible via [`LiveConfig::default()`].
 ///
 /// Pass to [`AggregateStoreBuilder::live_config`](crate::AggregateStoreBuilder::live_config)
 /// to customize.
@@ -33,24 +32,14 @@ use crate::store::AggregateStore;
 /// use eventfold_es::LiveConfig;
 ///
 /// let config = LiveConfig {
-///     checkpoint_interval: Duration::from_secs(10),
+///     reconnect_base_delay: Duration::from_millis(500),
 ///     ..LiveConfig::default()
 /// };
-/// assert_eq!(config.checkpoint_interval, Duration::from_secs(10));
-/// assert_eq!(config.reconnect_base_delay, Duration::from_secs(1));
+/// assert_eq!(config.reconnect_base_delay, Duration::from_millis(500));
+/// assert_eq!(config.reconnect_max_delay, Duration::from_secs(30));
 /// ```
 #[derive(Debug, Clone)]
 pub struct LiveConfig {
-    /// How often to flush projection and process manager checkpoints to disk
-    /// while in live mode.
-    ///
-    /// Checkpoints are also saved on graceful shutdown and when the stream
-    /// reconnects. A shorter interval reduces replay on crash; a longer
-    /// interval reduces disk I/O.
-    ///
-    /// Default: 5 seconds.
-    pub checkpoint_interval: Duration,
-
     /// Base delay for exponential backoff on stream reconnection.
     ///
     /// After a stream error, the loop waits `reconnect_base_delay`, then
@@ -69,7 +58,6 @@ pub struct LiveConfig {
 impl Default for LiveConfig {
     fn default() -> Self {
         Self {
-            checkpoint_interval: Duration::from_secs(5),
             reconnect_base_delay: Duration::from_secs(1),
             reconnect_max_delay: Duration::from_secs(30),
         }
@@ -81,7 +69,7 @@ impl Default for LiveConfig {
 /// Provides methods to check whether the loop has caught up with the
 /// historical event log and to shut it down gracefully. Dropping the
 /// handle does **not** stop the loop -- call [`shutdown`](LiveHandle::shutdown)
-/// for graceful termination with a final checkpoint save.
+/// for graceful termination.
 ///
 /// `Clone` is cheap: all fields are `Arc`-wrapped.
 #[derive(Clone)]
@@ -138,11 +126,10 @@ impl LiveHandle {
         self.position_tx.subscribe()
     }
 
-    /// Signal the live loop to stop and wait for a final checkpoint save.
+    /// Signal the live loop to stop and wait for it to exit.
     ///
     /// Sends the shutdown signal, then awaits the background task to
-    /// completion. The loop saves all projection and process manager
-    /// checkpoints before exiting.
+    /// completion.
     ///
     /// Calling `shutdown` more than once is safe -- subsequent calls
     /// return `Ok(())` immediately.
@@ -153,8 +140,7 @@ impl LiveHandle {
     ///
     /// # Errors
     ///
-    /// Returns `io::Error` if the loop's final checkpoint save or the
-    /// task join fails.
+    /// Returns `io::Error` if the task join fails.
     pub async fn shutdown(&self) -> io::Result<()> {
         // Signal the loop to stop. Ignore errors (receiver may already
         // be dropped if the task has exited).
@@ -181,38 +167,6 @@ enum StreamOutcome {
     Ended,
     /// A stream error occurred and should trigger reconnection.
     Error(io::Error),
-}
-
-/// Save all projection and process manager checkpoints to disk.
-///
-/// Iterates all registered projections and process managers, saving each
-/// checkpoint. Logs warnings on save failures but does not propagate them,
-/// since partial checkpoint failure should not crash the loop.
-async fn save_all_checkpoints(store: &AggregateStore) {
-    let projections = store.projections.read().await;
-    for (name, runner_mutex) in projections.iter() {
-        let runner = runner_mutex.lock().await;
-        if let Err(e) = runner.save() {
-            tracing::error!(
-                projection = %name,
-                error = %e,
-                "failed to save projection checkpoint"
-            );
-        }
-    }
-    drop(projections);
-
-    let pms = store.process_managers.read().await;
-    for pm_mutex in pms.iter() {
-        let pm = pm_mutex.lock().await;
-        if let Err(e) = pm.save() {
-            tracing::error!(
-                pm = pm.name(),
-                error = %e,
-                "failed to save PM checkpoint"
-            );
-        }
-    }
 }
 
 /// Compute the minimum global position across all projections and process
@@ -245,9 +199,8 @@ async fn min_global_position(store: &AggregateStore) -> u64 {
 ///
 /// This is the core background loop spawned by `AggregateStore::start_live()`.
 /// It holds a `SubscribeAll` stream open, fans out events to all projections
-/// and process managers, dispatches PM command envelopes, checkpoints
-/// periodically, reconnects on errors with exponential backoff, and shuts
-/// down gracefully when signaled.
+/// and process managers, dispatches PM command envelopes, reconnects on
+/// errors with exponential backoff, and shuts down gracefully when signaled.
 ///
 /// # Arguments
 ///
@@ -273,14 +226,10 @@ pub(crate) async fn run_live_loop(
 ) -> io::Result<()> {
     let config = store.live_config.clone();
     let mut backoff_delay = config.reconnect_base_delay;
-    let mut checkpoint_interval = tokio::time::interval(config.checkpoint_interval);
-    // The first tick completes immediately; consume it.
-    checkpoint_interval.tick().await;
 
     loop {
         // Check for shutdown before (re)connecting.
         if *shutdown_rx.borrow() {
-            save_all_checkpoints(&store).await;
             return Ok(());
         }
 
@@ -297,7 +246,6 @@ pub(crate) async fn run_live_loop(
                 tokio::select! {
                     _ = tokio::time::sleep(backoff_delay) => {}
                     _ = shutdown_rx.changed() => {
-                        save_all_checkpoints(&store).await;
                         return Ok(());
                     }
                 }
@@ -306,32 +254,23 @@ pub(crate) async fn run_live_loop(
             }
         };
 
-        // Process the stream with select! for shutdown and checkpoint.
+        // Process the stream, aborting on shutdown signal.
         let outcome = {
             let stream_fut = process_stream_with_dispatch(&store, stream, &caught_up, &position_tx);
             tokio::pin!(stream_fut);
 
-            loop {
-                tokio::select! {
-                    result = &mut stream_fut => {
-                        break result;
-                    }
-                    _ = checkpoint_interval.tick() => {
-                        save_all_checkpoints(&store).await;
-                    }
-                    _ = shutdown_rx.changed() => {
-                        save_all_checkpoints(&store).await;
-                        return Ok(());
-                    }
+            tokio::select! {
+                result = &mut stream_fut => result,
+                _ = shutdown_rx.changed() => {
+                    return Ok(());
                 }
             }
         };
 
         match outcome {
             Ok(StreamOutcome::Ended) => {
-                // Stream ended cleanly (e.g., server closed). Save checkpoints
-                // and reconnect without backoff if we already caught up.
-                save_all_checkpoints(&store).await;
+                // Stream ended cleanly (e.g., server closed). Reconnect
+                // without backoff if we already caught up.
                 if caught_up.load(Ordering::Acquire) {
                     // Was live, treat clean close as transient.
                     backoff_delay = config.reconnect_base_delay;
@@ -339,7 +278,6 @@ pub(crate) async fn run_live_loop(
             }
             Ok(StreamOutcome::Error(e)) => {
                 tracing::error!(error = %e, "live loop: stream error, will reconnect");
-                save_all_checkpoints(&store).await;
                 // Backoff before reconnecting.
                 tokio::select! {
                     _ = tokio::time::sleep(backoff_delay) => {}
@@ -351,7 +289,6 @@ pub(crate) async fn run_live_loop(
             }
             Err(e) => {
                 tracing::error!(error = %e, "live loop: unrecoverable error");
-                save_all_checkpoints(&store).await;
                 return Err(e);
             }
         }
@@ -462,9 +399,7 @@ async fn process_stream_with_dispatch(
                     }
                 }
 
-                // Notify subscribers of the newly processed position. `send`
-                // on a watch channel only fails if all receivers have been
-                // dropped, which is not an error -- the `let _` discards that.
+                // Notify subscribers of the newly processed position.
                 let _ = position_tx.send(recorded.global_position);
             }
             Some(subscribe_response::Content::CaughtUp(_)) => {
@@ -488,14 +423,12 @@ mod tests {
     #[test]
     fn live_config_default_values() {
         let config = LiveConfig::default();
-        assert_eq!(config.checkpoint_interval, Duration::from_secs(5));
         assert_eq!(config.reconnect_base_delay, Duration::from_secs(1));
         assert_eq!(config.reconnect_max_delay, Duration::from_secs(30));
     }
 
     #[test]
     fn live_handle_is_clone() {
-        // Verify LiveHandle derives Clone by constructing one and cloning it.
         let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
         let handle = LiveHandle {
             shutdown_tx,
@@ -574,14 +507,11 @@ mod tests {
         let mut rx1 = handle.subscribe();
         let mut rx2 = handle.subscribe();
 
-        // Both start at 0.
         assert_eq!(*rx1.borrow(), 0);
         assert_eq!(*rx2.borrow(), 0);
 
-        // Send a position update.
         position_tx.send(42).expect("send should succeed");
 
-        // Both receivers see the update.
         assert_eq!(*rx1.borrow_and_update(), 42);
         assert_eq!(*rx2.borrow_and_update(), 42);
     }
@@ -599,10 +529,8 @@ mod tests {
         };
         let cloned = handle.clone();
 
-        // The cloned handle shares the same underlying sender.
         assert!(Arc::ptr_eq(&handle.position_tx, &cloned.position_tx));
 
-        // Subscribe on the clone and verify it sees updates from the original.
         let mut rx = cloned.subscribe();
         assert_eq!(*rx.borrow(), 0);
 
@@ -636,7 +564,7 @@ mod tests {
     use crate::store::AggregateStore;
 
     /// A test projection that counts all events.
-    #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[derive(Debug, Clone, Default, PartialEq)]
     struct EventCounter {
         pub count: u64,
     }
@@ -648,7 +576,6 @@ mod tests {
         }
     }
 
-    /// Build a `RecordedEvent` with valid eventfold-es metadata.
     fn make_recorded_event(global_position: u64, stream_version: u64) -> RecordedEvent {
         let event_id = uuid::Uuid::new_v4().to_string();
         let stream_id = crate::event::stream_uuid("counter", "c-1").to_string();
@@ -668,7 +595,6 @@ mod tests {
         }
     }
 
-    /// Build a `SubscribeResponse` wrapping a `RecordedEvent`.
     #[allow(clippy::result_large_err)]
     fn event_response(
         global_position: u64,
@@ -682,7 +608,6 @@ mod tests {
         })
     }
 
-    /// Build a `SubscribeResponse` with the `CaughtUp` sentinel.
     #[allow(clippy::result_large_err)]
     fn caught_up_response() -> Result<SubscribeResponse, tonic::Status> {
         Ok(SubscribeResponse {
@@ -690,7 +615,6 @@ mod tests {
         })
     }
 
-    /// Build a mock `EsClient` with a lazy (non-connecting) channel.
     fn mock_client() -> EsClient {
         let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
         let inner = crate::proto::event_store_client::EventStoreClient::new(channel);
@@ -701,9 +625,7 @@ mod tests {
     fn mock_store_with_projection(base_dir: &Path) -> AggregateStore {
         let client = mock_client();
 
-        let checkpoint_dir = base_dir.join("projections").join("event-counter");
-        let runner = ProjectionRunner::<EventCounter>::new(client.clone(), checkpoint_dir)
-            .expect("runner creation should succeed");
+        let runner = ProjectionRunner::<EventCounter>::new(client.clone());
         let mut projections = HashMap::new();
         projections.insert(
             "event-counter".to_string(),
@@ -731,9 +653,7 @@ mod tests {
         let client = mock_client();
 
         // Projection
-        let proj_dir = base_dir.join("projections").join("event-counter");
-        let proj_runner = ProjectionRunner::<EventCounter>::new(client.clone(), proj_dir)
-            .expect("projection runner creation should succeed");
+        let proj_runner = ProjectionRunner::<EventCounter>::new(client.clone());
         let mut projections = HashMap::new();
         projections.insert(
             "event-counter".to_string(),
@@ -742,8 +662,7 @@ mod tests {
 
         // Process manager
         let pm_dir = base_dir.join("process_managers").join("echo-saga");
-        let pm_runner = ProcessManagerRunner::<EchoSaga>::new(client.clone(), pm_dir)
-            .expect("PM runner creation should succeed");
+        let pm_runner = ProcessManagerRunner::<EchoSaga>::new(client.clone(), pm_dir);
         let process_managers = vec![tokio::sync::Mutex::new(
             Box::new(pm_runner) as Box<dyn ProcessManagerCatchUp>
         )];
@@ -767,14 +686,12 @@ mod tests {
         let store = mock_store_with_projection(tmp.path());
         let caught_up = Arc::new(AtomicBool::new(false));
 
-        // Build a mock stream: 2 events + CaughtUp, then stream ends.
         let stream = tokio_stream::iter(vec![
             event_response(0, 0),
             event_response(1, 1),
             caught_up_response(),
         ]);
 
-        // Process the stream once (no reconnect needed -- stream ends after CaughtUp).
         process_stream_with_dispatch(
             &store,
             stream,
@@ -784,10 +701,8 @@ mod tests {
         .await
         .expect("should succeed");
 
-        // Verify caught_up flag was set.
         assert!(caught_up.load(Ordering::Acquire));
 
-        // Verify projection was updated with 2 events.
         let proj_map = store.projections.read().await;
         let runner = proj_map
             .get("event-counter")
@@ -806,8 +721,6 @@ mod tests {
         let store = mock_store_with_projection_and_pm(tmp.path());
         let caught_up = Arc::new(AtomicBool::new(false));
 
-        // Stream with one counter event that triggers EchoSaga to emit
-        // a command targeting "target" aggregate (which has no dispatcher).
         let stream = tokio_stream::iter(vec![event_response(0, 0), caught_up_response()]);
 
         process_stream_with_dispatch(
@@ -819,9 +732,6 @@ mod tests {
         .await
         .expect("should succeed");
 
-        // The EchoSaga PM should have produced an envelope targeting "target".
-        // Since no dispatcher is registered for "target", it should be
-        // dead-lettered.
         let dead_letter_path = tmp
             .path()
             .join("process_managers")
@@ -833,43 +743,6 @@ mod tests {
             contents.contains("unknown aggregate type: target"),
             "dead letter should mention unknown aggregate type"
         );
-    }
-
-    #[tokio::test]
-    async fn live_loop_saves_checkpoints_on_shutdown() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let store = mock_store_with_projection(tmp.path());
-        let caught_up = Arc::new(AtomicBool::new(false));
-
-        // Process 2 events.
-        let stream = tokio_stream::iter(vec![
-            event_response(0, 0),
-            event_response(1, 1),
-            caught_up_response(),
-        ]);
-        process_stream_with_dispatch(
-            &store,
-            stream,
-            &caught_up,
-            &tokio::sync::watch::channel(0u64).0,
-        )
-        .await
-        .expect("should succeed");
-
-        // Save checkpoints (simulating what shutdown does).
-        save_all_checkpoints(&store).await;
-
-        // Verify projection checkpoint was saved.
-        let checkpoint_path = tmp
-            .path()
-            .join("projections")
-            .join("event-counter")
-            .join("checkpoint.json");
-        let contents =
-            std::fs::read_to_string(&checkpoint_path).expect("checkpoint file should exist");
-        let parsed: serde_json::Value = serde_json::from_str(&contents).expect("valid JSON");
-        assert_eq!(parsed["last_global_position"], 2);
-        assert_eq!(parsed["state"]["count"], 2);
     }
 
     #[tokio::test]
@@ -895,10 +768,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("temp dir");
         let store = mock_store_with_projection_and_pm(tmp.path());
 
-        // Initially both start at position 0.
         assert_eq!(min_global_position(&store).await, 0);
 
-        // Process some events to advance projection position.
         let stream = tokio_stream::iter(vec![
             event_response(0, 0),
             event_response(1, 1),
@@ -914,15 +785,12 @@ mod tests {
         .await
         .expect("should succeed");
 
-        // Both projection and PM should have advanced to position 2.
         assert_eq!(min_global_position(&store).await, 2);
     }
 
     #[tokio::test]
     async fn backoff_respects_live_config_values() {
-        // Verify the backoff capping logic.
         let config = LiveConfig {
-            checkpoint_interval: Duration::from_secs(1),
             reconnect_base_delay: Duration::from_millis(100),
             reconnect_max_delay: Duration::from_millis(300),
         };
@@ -946,7 +814,6 @@ mod tests {
         let store = mock_store_with_projection(tmp.path());
         let caught_up = Arc::new(AtomicBool::new(false));
 
-        // Stream that yields one event, then an error.
         let stream = tokio_stream::iter(vec![
             event_response(0, 0),
             Err(tonic::Status::internal("connection lost")),
@@ -966,7 +833,6 @@ mod tests {
             "should be StreamOutcome::Error"
         );
 
-        // Projection should still have the first event applied.
         let proj_map = store.projections.read().await;
         let runner = proj_map
             .get("event-counter")
@@ -986,7 +852,6 @@ mod tests {
         let caught_up = Arc::new(AtomicBool::new(false));
         let (position_tx, position_rx) = tokio::sync::watch::channel(0u64);
 
-        // Build a two-event stream followed by CaughtUp.
         let stream = tokio_stream::iter(vec![
             event_response(0, 0),
             event_response(1, 1),
@@ -997,58 +862,6 @@ mod tests {
             .await
             .expect("should succeed");
 
-        // The position sender should carry the global_position of the last event.
         assert_eq!(*position_rx.borrow(), 1);
-    }
-
-    #[tokio::test]
-    async fn run_live_loop_shutdown_saves_checkpoints() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let store = mock_store_with_projection(tmp.path());
-
-        // Pre-process some events so the projection has state.
-        {
-            let caught_up = Arc::new(AtomicBool::new(false));
-            let stream = tokio_stream::iter(vec![event_response(0, 0), caught_up_response()]);
-            process_stream_with_dispatch(
-                &store,
-                stream,
-                &caught_up,
-                &tokio::sync::watch::channel(0u64).0,
-            )
-            .await
-            .expect("should succeed");
-        }
-
-        // Create a LiveHandle wrapping a task that just saves checkpoints
-        // via shutdown.
-        let caught_up_flag = Arc::new(AtomicBool::new(true));
-        let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
-
-        let store_clone = store.clone();
-        let task = tokio::spawn(async move {
-            save_all_checkpoints(&store_clone).await;
-            Ok(())
-        });
-
-        let handle = LiveHandle {
-            shutdown_tx,
-            caught_up: caught_up_flag,
-            position_tx: Arc::new(tokio::sync::watch::channel(0u64).0),
-            task: Arc::new(tokio::sync::Mutex::new(Some(task))),
-        };
-
-        handle.shutdown().await.expect("shutdown should succeed");
-
-        // Verify checkpoint was saved.
-        let checkpoint_path = tmp
-            .path()
-            .join("projections")
-            .join("event-counter")
-            .join("checkpoint.json");
-        let contents =
-            std::fs::read_to_string(&checkpoint_path).expect("checkpoint file should exist");
-        let parsed: serde_json::Value = serde_json::from_str(&contents).expect("valid JSON");
-        assert_eq!(parsed["last_global_position"], 1);
     }
 }

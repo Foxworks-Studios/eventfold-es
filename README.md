@@ -8,11 +8,11 @@ Designed for multi-process, multi-machine applications that need consistent even
 
 - **Aggregates** -- define domain models with command handlers and event applicators
 - **Actor-per-instance** -- each aggregate runs as a tokio task with optimistic concurrency (3x retry)
-- **Projections** -- cross-stream read models via `SubscribeAll` with global cursor checkpointing
+- **Projections** -- cross-stream read models via `SubscribeAll` with in-memory global cursor
 - **Process managers** -- cross-aggregate workflows that react to events with commands
-- **Live subscriptions** -- persistent `SubscribeAll` stream that keeps projections always-current and process managers continuously reactive, with configurable checkpointing and exponential backoff reconnection
-- **Snapshots** -- local file-based snapshots for fast actor recovery without full stream replay
-- **Idle eviction** -- actors shut down after configurable inactivity, re-spawn transparently
+- **Live subscriptions** -- persistent `SubscribeAll` stream that keeps projections always-current and process managers continuously reactive, with exponential backoff reconnection
+- **Idle eviction** -- actors shut down after configurable inactivity, re-spawn transparently from the event log
+- **TLS and Bearer auth** -- opt-in TLS via `tls` feature flag, refreshable Bearer token injection for authenticated connections
 - **Tracing** -- structured instrumentation via the `tracing` crate throughout
 
 ## Prerequisites
@@ -87,7 +87,7 @@ See [`examples/counter.rs`](examples/counter.rs) for a full example with project
 | [`AggregateHandle`] | Async handle to a running aggregate actor |
 | [`StoredEvent`] | Decoded event delivered to projections/PMs with aggregate type, instance ID, and timestamp |
 | [`CommandContext`] | Cross-cutting metadata (actor identity, correlation ID, source device) |
-| [`LiveConfig`] | Tuning knobs for checkpoint interval and reconnect backoff in live mode |
+| [`LiveConfig`] | Tuning knobs for reconnect backoff in live mode |
 | [`LiveHandle`] | Control handle for the live subscription loop (shutdown, caught-up check) |
 
 [`Aggregate`]: https://docs.rs/eventfold-es/latest/eventfold_es/trait.Aggregate.html
@@ -131,22 +131,17 @@ Actor       ProjectionRunner / ProcessManagerRunner
 
 Each aggregate instance runs as a **tokio task** (not a blocking thread). The actor owns the in-memory state and processes commands sequentially. Writes use `ExpectedVersion::Exact(v)` for optimistic concurrency with up to 3 automatic retries on conflict.
 
-Projections and process managers consume the **global event log** via `SubscribeAll`, replacing per-stream cursors with a single `global_position` checkpoint.
+Projections and process managers consume the **global event log** via `SubscribeAll`, tracking a single `global_position` in memory.
 
-Idle actors shut down after a configurable timeout (default 5 minutes), saving a local snapshot. The next `store.get()` transparently re-spawns the actor and recovers from the snapshot + any new events.
+Idle actors shut down after a configurable timeout (default 5 minutes). The next `store.get()` transparently re-spawns the actor and replays the full stream from the event log.
 
 ## Local Storage Layout
 
-Local caches live under `base_dir` (snapshots and checkpoints only -- events are in eventfold-db):
+Local files live under `base_dir`. All state is rebuilt from the event log on startup -- there are no snapshots or checkpoints.
 
 ```
 <base_dir>/
-    snapshots/<aggregate_type>/<instance_id>/
-        snapshot.json               # aggregate state + stream version
-    projections/<name>/
-        checkpoint.json             # projection state + global position
     process_managers/<name>/
-        checkpoint.json             # PM state + global position
         dead_letters.jsonl          # failed command dispatches
 ```
 
@@ -165,12 +160,13 @@ let store = AggregateStoreBuilder::new()
 ```
 
 - **`endpoint(url)`** -- eventfold-db gRPC server address
-- **`base_dir(path)`** -- local directory for snapshots and checkpoints
+- **`base_dir(path)`** -- local directory for dead-letter logs
 - **`projection::<P>()`** -- register a read model
 - **`process_manager::<PM>()`** -- register a workflow coordinator
 - **`aggregate_type::<A>()`** -- register a dispatch target (requires `A::Command: DeserializeOwned`)
 - **`idle_timeout(dur)`** -- set actor eviction timeout (default: 5 min)
-- **`live_config(config)`** -- set [`LiveConfig`] for checkpoint interval and reconnect backoff
+- **`auth_token(token)`** -- attach a refreshable `Arc<RwLock<String>>` Bearer token for authenticated connections
+- **`live_config(config)`** -- set [`LiveConfig`] for reconnect backoff
 
 ## Live Subscriptions
 
@@ -194,7 +190,7 @@ if live.is_caught_up() {
     println!("all caught up, live tail active");
 }
 
-// Graceful shutdown (saves final checkpoints)
+// Graceful shutdown
 live.shutdown().await?;
 ```
 
@@ -202,7 +198,7 @@ The pull-based `store.projection::<P>()` and `store.run_process_managers()` rema
 
 ### LiveConfig
 
-Configure checkpoint frequency and reconnect behavior via the builder:
+Configure reconnect behavior via the builder:
 
 ```rust
 let store = AggregateStoreBuilder::new()
@@ -212,7 +208,6 @@ let store = AggregateStoreBuilder::new()
     .process_manager::<MySaga>()
     .aggregate_type::<Target>()
     .live_config(LiveConfig {
-        checkpoint_interval: Duration::from_secs(10),
         reconnect_base_delay: Duration::from_millis(500),
         ..LiveConfig::default()
     })
@@ -222,11 +217,40 @@ let store = AggregateStoreBuilder::new()
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `checkpoint_interval` | 5s | How often to flush checkpoints to disk during live mode |
 | `reconnect_base_delay` | 1s | Initial backoff delay after a stream disconnection |
 | `reconnect_max_delay` | 30s | Cap on exponential backoff between reconnect attempts |
 
-Checkpoints are also saved on graceful shutdown and before each reconnect attempt.
+## TLS and Authentication
+
+Enable TLS transport by adding the `tls` feature:
+
+```toml
+[dependencies]
+eventfold-es = { version = "0.6", features = ["tls"] }
+```
+
+Connect with Bearer token authentication using a shared, refreshable token:
+
+```rust
+use std::sync::{Arc, RwLock};
+
+let token = Arc::new(RwLock::new("my-jwt-token".to_string()));
+
+let store = AggregateStoreBuilder::new()
+    .endpoint("https://es.example.com:443")
+    .base_dir("/tmp/my-app")
+    .auth_token(token.clone())
+    .open()
+    .await?;
+
+// Token is read on every RPC. Update it in-place for refresh:
+*token.write().unwrap() = "refreshed-token".to_string();
+// Next RPC automatically uses the new token.
+```
+
+Without `.auth_token()`, no `Authorization` header is sent (backward-compatible). An empty token string also suppresses the header.
+
+For lower-level usage, `EsClient::connect_with_token(endpoint, token)` provides the same behavior without the builder.
 
 ## Stream ID Mapping
 

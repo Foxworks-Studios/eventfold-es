@@ -5,17 +5,10 @@
 //! different) aggregates. They are structurally similar to projections
 //! -- they use a global cursor for catch-up -- but produce side effects
 //! (commands) rather than read models.
-//!
-//! Unlike projections, `catch_up` does **not** save the checkpoint.
-//! The caller dispatches the returned envelopes first, then calls
-//! [`ProcessManagerRunner::save`] to persist the checkpoint. This
-//! ensures crash safety: a crash mid-dispatch causes re-processing
-//! on restart.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 
@@ -37,11 +30,8 @@ use crate::proto::{self, subscribe_response};
 ///   same sequence of events, it must produce the same command envelopes.
 /// - Unknown event types or aggregate types should be silently ignored
 ///   for forward compatibility.
-/// - State is checkpointed after all envelopes from a catch-up pass
-///   have been dispatched (or dead-lettered), ensuring crash safety
-///   via re-processing.
-pub trait ProcessManager: Default + Serialize + DeserializeOwned + Send + Sync + 'static {
-    /// Human-readable name, used as a directory name for checkpoints.
+pub trait ProcessManager: Default + Send + Sync + 'static {
+    /// Human-readable name, used as an identifier for the process manager.
     const NAME: &'static str;
 
     /// React to a single event from the global log.
@@ -62,154 +52,52 @@ pub trait ProcessManager: Default + Serialize + DeserializeOwned + Send + Sync +
     fn react(&mut self, event: &StoredEvent) -> Vec<CommandEnvelope>;
 }
 
-/// Persisted state of a process manager including the global cursor position.
-///
-/// Serialized to JSON as `{ "state": <PM>, "last_global_position": <N> }`.
-/// The `last_global_position` field is a resume token: the next global
-/// position to read from. A value of `0` means "start from the beginning."
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ProcessManagerCheckpoint<PM> {
-    /// The process manager's current state.
-    pub state: PM,
-    /// Resume token: the next global position to read from.
-    ///
-    /// After processing an event at global position N, this is set to N + 1.
-    /// A value of 0 means no events have been processed yet.
-    pub last_global_position: u64,
-}
-
-impl<PM: Default> Default for ProcessManagerCheckpoint<PM> {
-    fn default() -> Self {
-        Self {
-            state: PM::default(),
-            last_global_position: 0,
-        }
-    }
-}
-
-// --- Checkpoint persistence helpers ---
-
-/// Save a process manager checkpoint atomically.
-///
-/// Writes to a temporary file then renames to `checkpoint.json` in `dir`.
-/// Creates `dir` if it does not exist.
-///
-/// # Arguments
-///
-/// * `dir` - Directory to store the checkpoint file in.
-/// * `checkpoint` - The checkpoint to persist.
-///
-/// # Errors
-///
-/// Returns `io::Error` if directory creation, file writing, or renaming fails.
-pub(crate) fn save_pm_checkpoint<PM: ProcessManager>(
-    dir: &Path,
-    checkpoint: &ProcessManagerCheckpoint<PM>,
-) -> io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join("checkpoint.json");
-    let tmp_path = dir.join("checkpoint.json.tmp");
-    let json = serde_json::to_string_pretty(checkpoint).map_err(io::Error::other)?;
-    std::fs::write(&tmp_path, json)?;
-    std::fs::rename(&tmp_path, &path)?;
-    Ok(())
-}
-
-/// Load a process manager checkpoint from disk.
-///
-/// Returns `Ok(None)` if the file does not exist or is corrupt.
-/// A corrupt checkpoint is not a hard error -- the process manager will rebuild.
-///
-/// # Arguments
-///
-/// * `dir` - Directory containing the `checkpoint.json` file.
-///
-/// # Errors
-///
-/// Returns `io::Error` for I/O failures other than file-not-found.
-pub(crate) fn load_pm_checkpoint<PM: ProcessManager>(
-    dir: &Path,
-) -> io::Result<Option<ProcessManagerCheckpoint<PM>>> {
-    let path = dir.join("checkpoint.json");
-    match std::fs::read_to_string(&path) {
-        Ok(content) => match serde_json::from_str(&content) {
-            Ok(checkpoint) => Ok(Some(checkpoint)),
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "corrupt process manager checkpoint, will rebuild"
-                );
-                Ok(None)
-            }
-        },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
 // --- ProcessManagerRunner ---
 
 /// Drives a process manager's catch-up loop, reading events from the
 /// global log and collecting command envelopes for dispatch.
 ///
-/// Manages the lifecycle of a single [`ProcessManager`]: loading its
-/// persisted checkpoint, catching up on new events via `SubscribeAll`,
-/// and allowing the caller to save the checkpoint after dispatch.
-///
-/// Unlike [`ProjectionRunner`](crate::projection::ProjectionRunner),
-/// `catch_up` does **not** persist the checkpoint. Instead it returns
-/// the collected envelopes, and the caller must invoke
-/// [`save`](ProcessManagerRunner::save) after all envelopes have been
-/// dispatched (or dead-lettered). This ensures crash safety: a crash
-/// mid-dispatch causes re-processing on restart.
+/// Manages the lifecycle of a single [`ProcessManager`]: catching up on
+/// new events via `SubscribeAll` and collecting command envelopes. The
+/// runner tracks its position in memory (starting from 0 on each startup).
 pub(crate) struct ProcessManagerRunner<PM: ProcessManager> {
-    /// The process manager's persisted state and global cursor position.
-    checkpoint: ProcessManagerCheckpoint<PM>,
+    /// The process manager's current state.
+    state: PM,
+    /// Resume token: the next global position to read from.
+    last_global_position: u64,
     /// gRPC client for subscribing to the global log.
     client: crate::client::EsClient,
-    /// Directory where this process manager's checkpoint file is stored.
-    checkpoint_dir: PathBuf,
+    /// Root directory for this process manager's data files (dead-letter log).
+    data_dir: PathBuf,
 }
 
 impl<PM: ProcessManager> ProcessManagerRunner<PM> {
-    /// Create a new runner, loading an existing checkpoint from disk if available.
-    ///
-    /// If no checkpoint file exists, the runner starts with a default
-    /// (empty) process manager state at global position 0.
+    /// Create a new runner starting from global position 0.
     ///
     /// # Arguments
     ///
     /// * `client` - The gRPC client for subscribing to the global event log.
-    /// * `checkpoint_dir` - Directory where this process manager's checkpoint
-    ///   file is stored.
-    ///
-    /// # Errors
-    ///
-    /// Returns `io::Error` if reading an existing checkpoint file fails
-    /// (other than file-not-found).
-    pub(crate) fn new(
-        client: crate::client::EsClient,
-        checkpoint_dir: PathBuf,
-    ) -> io::Result<Self> {
-        let checkpoint = load_pm_checkpoint::<PM>(&checkpoint_dir)?.unwrap_or_default();
-        Ok(Self {
-            checkpoint,
+    /// * `data_dir` - Directory for this process manager's data files
+    ///   (currently only the dead-letter log).
+    pub(crate) fn new(client: crate::client::EsClient, data_dir: PathBuf) -> Self {
+        Self {
+            state: PM::default(),
+            last_global_position: 0,
             client,
-            checkpoint_dir,
-        })
+            data_dir,
+        }
     }
 
     /// Returns the current process manager state.
     #[allow(dead_code)] // Public API for callers inspecting runner state.
     pub(crate) fn state(&self) -> &PM {
-        &self.checkpoint.state
+        &self.state
     }
 
     /// Returns the current global cursor position (resume token).
     #[allow(dead_code)] // Public API for callers inspecting runner state.
     pub(crate) fn position(&self) -> u64 {
-        self.checkpoint.last_global_position
+        self.last_global_position
     }
 
     /// Catch up on new events from the global log.
@@ -217,10 +105,6 @@ impl<PM: ProcessManager> ProcessManagerRunner<PM> {
     /// Subscribes to the global event log starting at the current cursor
     /// position, reads until a `CaughtUp` message, decodes and reacts to
     /// each event, and collects the resulting command envelopes.
-    ///
-    /// Does **not** save the checkpoint. The caller must invoke
-    /// [`save`](ProcessManagerRunner::save) after dispatching all
-    /// returned envelopes.
     ///
     /// Events with missing or unparseable metadata (non-eventfold-es events)
     /// are silently skipped.
@@ -232,14 +116,15 @@ impl<PM: ProcessManager> ProcessManagerRunner<PM> {
     pub(crate) async fn catch_up(&mut self) -> io::Result<Vec<CommandEnvelope>> {
         let stream = self
             .client
-            .subscribe_all_from(self.checkpoint.last_global_position)
+            .subscribe_all_from(self.last_global_position)
             .await
             .map_err(|e| io::Error::other(format!("subscribe_all_from failed: {e}")))?;
 
-        Self::process_stream(&mut self.checkpoint, stream).await
+        Self::process_stream(&mut self.state, &mut self.last_global_position, stream).await
     }
 
-    /// Process a stream of `SubscribeResponse` messages, updating the checkpoint.
+    /// Process a stream of `SubscribeResponse` messages, updating state
+    /// and position.
     ///
     /// Reads from the stream until a `CaughtUp` message is received. For each
     /// `RecordedEvent`, attempts to decode it via [`decode_stored_event`]. Events
@@ -250,7 +135,8 @@ impl<PM: ProcessManager> ProcessManagerRunner<PM> {
     /// This function is factored out of [`catch_up`] so that tests can provide
     /// a mock stream without needing a live gRPC server.
     async fn process_stream(
-        checkpoint: &mut ProcessManagerCheckpoint<PM>,
+        state: &mut PM,
+        last_global_position: &mut u64,
         mut stream: impl tokio_stream::Stream<Item = Result<proto::SubscribeResponse, tonic::Status>>
         + Unpin,
     ) -> io::Result<Vec<CommandEnvelope>> {
@@ -264,11 +150,7 @@ impl<PM: ProcessManager> ProcessManagerRunner<PM> {
 
             match response.content {
                 Some(subscribe_response::Content::Event(recorded)) => {
-                    let produced = react_recorded_event(
-                        &mut checkpoint.state,
-                        &mut checkpoint.last_global_position,
-                        &recorded,
-                    );
+                    let produced = react_recorded_event(state, last_global_position, &recorded);
                     envelopes.extend(produced);
                 }
                 Some(subscribe_response::Content::CaughtUp(_)) => {
@@ -284,32 +166,14 @@ impl<PM: ProcessManager> ProcessManagerRunner<PM> {
         Ok(envelopes)
     }
 
-    /// Persist the current checkpoint to disk.
-    ///
-    /// Should be called after all envelopes from a catch-up pass have been
-    /// dispatched (or dead-lettered).
-    ///
-    /// # Errors
-    ///
-    /// Returns `io::Error` if writing the checkpoint fails.
-    pub(crate) fn save(&self) -> io::Result<()> {
-        save_pm_checkpoint::<PM>(&self.checkpoint_dir, &self.checkpoint)
-    }
-
-    /// Returns the process manager name.
-    #[allow(dead_code)] // Used by ProcessManagerCatchUp trait impl.
-    pub(crate) fn name(&self) -> &str {
-        PM::NAME
-    }
-
     /// Returns the path to this process manager's dead-letter log.
     pub(crate) fn dead_letter_path(&self) -> PathBuf {
-        self.checkpoint_dir.join("dead_letters.jsonl")
+        self.data_dir.join("dead_letters.jsonl")
     }
 }
 
 /// Decode a single [`proto::RecordedEvent`] and react to it with a process
-/// manager, advancing the checkpoint position.
+/// manager, advancing the position.
 ///
 /// This helper is shared between [`ProcessManagerRunner::process_stream`]
 /// (batch catch-up) and [`ProcessManagerCatchUp::react_event`] (single-event
@@ -355,16 +219,13 @@ fn react_recorded_event<PM: ProcessManager>(
 /// type. All async methods use boxed futures for trait-object compatibility.
 pub(crate) trait ProcessManagerCatchUp: Send + Sync {
     /// Catch up on the global event log and return command envelopes.
-    ///
-    /// Does **not** persist the checkpoint.
     fn catch_up(
         &mut self,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = io::Result<Vec<CommandEnvelope>>> + Send + '_>,
     >;
 
-    /// Decode and react to a single recorded event, advancing the checkpoint
-    /// position.
+    /// Decode and react to a single recorded event, advancing the position.
     ///
     /// Used by the live subscription loop to process events one at a time
     /// rather than draining a full stream. Returns any command envelopes
@@ -373,12 +234,6 @@ pub(crate) trait ProcessManagerCatchUp: Send + Sync {
 
     /// Returns the current global cursor position (resume token).
     fn position(&self) -> u64;
-
-    /// Persist the checkpoint to disk.
-    fn save(&self) -> io::Result<()>;
-
-    /// Returns the process manager name.
-    fn name(&self) -> &str;
 
     /// Returns the path to the dead-letter log file.
     fn dead_letter_path(&self) -> PathBuf;
@@ -394,23 +249,11 @@ impl<PM: ProcessManager> ProcessManagerCatchUp for ProcessManagerRunner<PM> {
     }
 
     fn react_event(&mut self, recorded: &proto::RecordedEvent) -> Vec<CommandEnvelope> {
-        react_recorded_event(
-            &mut self.checkpoint.state,
-            &mut self.checkpoint.last_global_position,
-            recorded,
-        )
+        react_recorded_event(&mut self.state, &mut self.last_global_position, recorded)
     }
 
     fn position(&self) -> u64 {
-        self.checkpoint.last_global_position
-    }
-
-    fn save(&self) -> io::Result<()> {
-        self.save()
-    }
-
-    fn name(&self) -> &str {
-        self.name()
+        self.last_global_position
     }
 
     fn dead_letter_path(&self) -> PathBuf {
@@ -454,8 +297,7 @@ pub(crate) fn append_dead_letter(
         ts,
     };
     let json = serde_json::to_string(&entry).map_err(io::Error::other)?;
-    // Ensure the parent directory exists (the PM checkpoint dir may not
-    // have been created yet if no catch_up save has occurred).
+    // Ensure the parent directory exists.
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -493,7 +335,6 @@ pub(crate) mod test_fixtures {
         const NAME: &'static str = "echo-saga";
 
         fn react(&mut self, event: &StoredEvent) -> Vec<CommandEnvelope> {
-            // Only react to "counter" aggregate events.
             if event.aggregate_type != "counter" {
                 return Vec::new();
             }
@@ -521,7 +362,6 @@ mod tests {
 
     // --- Helper functions for building mock stream responses ---
 
-    /// Build a `RecordedEvent` with valid eventfold-es metadata.
     fn make_recorded_event(global_position: u64, stream_version: u64) -> RecordedEvent {
         let event_id = uuid::Uuid::new_v4().to_string();
         let stream_id = crate::event::stream_uuid("counter", "c-1").to_string();
@@ -541,7 +381,6 @@ mod tests {
         }
     }
 
-    /// Build a `SubscribeResponse` wrapping a `RecordedEvent`.
     #[allow(clippy::result_large_err)]
     fn event_response(
         global_position: u64,
@@ -555,7 +394,6 @@ mod tests {
         })
     }
 
-    /// Build a `SubscribeResponse` with the `CaughtUp` sentinel.
     #[allow(clippy::result_large_err)]
     fn caught_up_response() -> Result<SubscribeResponse, tonic::Status> {
         Ok(SubscribeResponse {
@@ -567,7 +405,6 @@ mod tests {
 
     #[test]
     fn process_manager_trait_has_no_subscriptions_method() {
-        // Verify the new trait shape: NAME + react(&mut self, &StoredEvent).
         let mut saga = EchoSaga::default();
         let stored = StoredEvent {
             event_id: uuid::Uuid::new_v4(),
@@ -589,113 +426,51 @@ mod tests {
         assert_eq!(saga.events_seen, 1);
     }
 
-    // --- Checkpoint tests ---
-
-    #[test]
-    fn checkpoint_serialization_roundtrip() {
-        let checkpoint = ProcessManagerCheckpoint {
-            state: EchoSaga { events_seen: 5 },
-            last_global_position: 42,
-        };
-        let json = serde_json::to_string(&checkpoint).expect("serialization should succeed");
-        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse should succeed");
-        assert_eq!(parsed["state"]["events_seen"], 5);
-        assert_eq!(parsed["last_global_position"], 42);
-
-        // Full roundtrip.
-        let loaded: ProcessManagerCheckpoint<EchoSaga> =
-            serde_json::from_str(&json).expect("deserialization should succeed");
-        assert_eq!(loaded.state, checkpoint.state);
-        assert_eq!(loaded.last_global_position, checkpoint.last_global_position);
-    }
-
-    #[test]
-    fn checkpoint_default_has_position_zero() {
-        let checkpoint = ProcessManagerCheckpoint::<EchoSaga>::default();
-        assert_eq!(checkpoint.state.events_seen, 0);
-        assert_eq!(checkpoint.last_global_position, 0);
-    }
-
-    // --- Checkpoint persistence tests ---
-
-    #[test]
-    fn save_then_load_roundtrips() {
-        let dir = tempfile::tempdir().expect("failed to create tmpdir");
-        let checkpoint = ProcessManagerCheckpoint {
-            state: EchoSaga { events_seen: 7 },
-            last_global_position: 99,
-        };
-
-        save_pm_checkpoint(dir.path(), &checkpoint).expect("save should succeed");
-        let loaded: ProcessManagerCheckpoint<EchoSaga> = load_pm_checkpoint(dir.path())
-            .expect("load should succeed")
-            .expect("checkpoint should exist");
-
-        assert_eq!(loaded.state, checkpoint.state);
-        assert_eq!(loaded.last_global_position, checkpoint.last_global_position);
-    }
-
-    #[test]
-    fn load_from_empty_dir_returns_none() {
-        let dir = tempfile::tempdir().expect("failed to create tmpdir");
-        let result = load_pm_checkpoint::<EchoSaga>(dir.path()).expect("load should not error");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn corrupt_file_returns_none() {
-        let dir = tempfile::tempdir().expect("failed to create tmpdir");
-        std::fs::write(dir.path().join("checkpoint.json"), "not valid json!!!")
-            .expect("write should succeed");
-        let loaded = load_pm_checkpoint::<EchoSaga>(dir.path()).expect("load should not error");
-        assert!(loaded.is_none());
-    }
-
     // --- process_stream / catch_up tests ---
 
     #[tokio::test]
     async fn catch_up_with_one_valid_event_returns_one_envelope() {
-        let mut checkpoint = ProcessManagerCheckpoint::<EchoSaga>::default();
+        let mut state = EchoSaga::default();
+        let mut position = 0u64;
         let stream = tokio_stream::iter(vec![event_response(0, 0), caught_up_response()]);
 
-        let envelopes = ProcessManagerRunner::<EchoSaga>::process_stream(&mut checkpoint, stream)
-            .await
-            .expect("process_stream should succeed");
+        let envelopes =
+            ProcessManagerRunner::<EchoSaga>::process_stream(&mut state, &mut position, stream)
+                .await
+                .expect("process_stream should succeed");
 
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].aggregate_type, "target");
         assert_eq!(envelopes[0].instance_id, "c-1");
-        assert_eq!(checkpoint.state.events_seen, 1);
-        // Resume token should be global_position + 1 = 1.
-        assert_eq!(checkpoint.last_global_position, 1);
+        assert_eq!(state.events_seen, 1);
+        assert_eq!(position, 1);
     }
 
     #[tokio::test]
-    async fn second_catch_up_with_saved_checkpoint_returns_empty() {
-        // First pass: process one event.
-        let mut checkpoint = ProcessManagerCheckpoint::<EchoSaga>::default();
+    async fn second_catch_up_returns_empty() {
+        let mut state = EchoSaga::default();
+        let mut position = 0u64;
         let stream = tokio_stream::iter(vec![event_response(0, 0), caught_up_response()]);
 
-        let envelopes = ProcessManagerRunner::<EchoSaga>::process_stream(&mut checkpoint, stream)
-            .await
-            .expect("first process_stream should succeed");
+        let envelopes =
+            ProcessManagerRunner::<EchoSaga>::process_stream(&mut state, &mut position, stream)
+                .await
+                .expect("first process_stream should succeed");
         assert_eq!(envelopes.len(), 1);
 
-        // Simulate: caller saves checkpoint, then no new events on second pass.
         let stream = tokio_stream::iter(vec![caught_up_response()]);
 
-        let envelopes = ProcessManagerRunner::<EchoSaga>::process_stream(&mut checkpoint, stream)
-            .await
-            .expect("second process_stream should succeed");
+        let envelopes =
+            ProcessManagerRunner::<EchoSaga>::process_stream(&mut state, &mut position, stream)
+                .await
+                .expect("second process_stream should succeed");
         assert!(envelopes.is_empty());
-        assert_eq!(checkpoint.state.events_seen, 1);
-        assert_eq!(checkpoint.last_global_position, 1);
+        assert_eq!(state.events_seen, 1);
+        assert_eq!(position, 1);
     }
 
     #[tokio::test]
     async fn non_es_events_skipped_returns_empty() {
-        // RecordedEvent with metadata = b"{}" has no aggregate_type or instance_id,
-        // so decode_stored_event returns None and the event is skipped.
         let recorded = RecordedEvent {
             event_id: uuid::Uuid::new_v4().to_string(),
             stream_id: uuid::Uuid::new_v4().to_string(),
@@ -712,33 +487,31 @@ mod tests {
             }),
             caught_up_response(),
         ]);
-        let mut checkpoint = ProcessManagerCheckpoint::<EchoSaga>::default();
+        let mut state = EchoSaga::default();
+        let mut position = 0u64;
 
-        let envelopes = ProcessManagerRunner::<EchoSaga>::process_stream(&mut checkpoint, stream)
-            .await
-            .expect("process_stream should succeed");
+        let envelopes =
+            ProcessManagerRunner::<EchoSaga>::process_stream(&mut state, &mut position, stream)
+                .await
+                .expect("process_stream should succeed");
 
-        // Event was skipped, no envelopes produced.
         assert!(envelopes.is_empty());
-        assert_eq!(checkpoint.state.events_seen, 0);
-        // But position should still advance past the skipped event.
-        assert_eq!(checkpoint.last_global_position, 6);
+        assert_eq!(state.events_seen, 0);
+        assert_eq!(position, 6);
     }
 
     // --- ProcessManagerCatchUp trait method tests ---
 
     #[tokio::test]
     async fn pm_catch_up_react_event_decodes_and_advances_position() {
-        let dir = tempfile::tempdir().expect("failed to create tmpdir");
-        let checkpoint_dir = dir.path().join("echo-saga");
-        std::fs::create_dir_all(&checkpoint_dir).expect("create dir");
+        let tmp = tempfile::tempdir().expect("failed to create tmpdir");
+        let data_dir = tmp.path().join("echo-saga");
 
         let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
         let inner = crate::proto::event_store_client::EventStoreClient::new(channel);
         let client = crate::client::EsClient::from_inner(inner);
 
-        let mut runner = ProcessManagerRunner::<EchoSaga>::new(client, checkpoint_dir)
-            .expect("runner creation should succeed");
+        let mut runner = ProcessManagerRunner::<EchoSaga>::new(client, data_dir);
 
         let recorded = make_recorded_event(5, 0);
         let catch_up: &mut dyn ProcessManagerCatchUp = &mut runner;
@@ -751,16 +524,14 @@ mod tests {
 
     #[tokio::test]
     async fn pm_catch_up_position_starts_at_zero() {
-        let dir = tempfile::tempdir().expect("failed to create tmpdir");
-        let checkpoint_dir = dir.path().join("echo-saga");
-        std::fs::create_dir_all(&checkpoint_dir).expect("create dir");
+        let tmp = tempfile::tempdir().expect("failed to create tmpdir");
+        let data_dir = tmp.path().join("echo-saga");
 
         let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
         let inner = crate::proto::event_store_client::EventStoreClient::new(channel);
         let client = crate::client::EsClient::from_inner(inner);
 
-        let runner = ProcessManagerRunner::<EchoSaga>::new(client, checkpoint_dir)
-            .expect("runner creation should succeed");
+        let runner = ProcessManagerRunner::<EchoSaga>::new(client, data_dir);
 
         let catch_up: &dyn ProcessManagerCatchUp = &runner;
         assert_eq!(catch_up.position(), 0);
@@ -768,18 +539,15 @@ mod tests {
 
     #[tokio::test]
     async fn pm_catch_up_react_event_skips_non_es_events() {
-        let dir = tempfile::tempdir().expect("failed to create tmpdir");
-        let checkpoint_dir = dir.path().join("echo-saga");
-        std::fs::create_dir_all(&checkpoint_dir).expect("create dir");
+        let tmp = tempfile::tempdir().expect("failed to create tmpdir");
+        let data_dir = tmp.path().join("echo-saga");
 
         let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
         let inner = crate::proto::event_store_client::EventStoreClient::new(channel);
         let client = crate::client::EsClient::from_inner(inner);
 
-        let mut runner = ProcessManagerRunner::<EchoSaga>::new(client, checkpoint_dir)
-            .expect("runner creation should succeed");
+        let mut runner = ProcessManagerRunner::<EchoSaga>::new(client, data_dir);
 
-        // RecordedEvent with empty metadata -- cannot be decoded.
         let recorded = RecordedEvent {
             event_id: uuid::Uuid::new_v4().to_string(),
             stream_id: uuid::Uuid::new_v4().to_string(),
@@ -794,7 +562,6 @@ mod tests {
         let catch_up: &mut dyn ProcessManagerCatchUp = &mut runner;
         let envelopes = catch_up.react_event(&recorded);
 
-        // Non-decodable event produces no envelopes but advances position.
         assert!(envelopes.is_empty());
         assert_eq!(catch_up.position(), 4);
     }
@@ -803,11 +570,9 @@ mod tests {
 
     #[test]
     fn react_recorded_event_skips_already_processed_positions() {
-        // Simulate a PM at position 5 (has processed events 0..5).
         let mut state = EchoSaga::default();
         let mut position: u64 = 5;
 
-        // Event at position 3 should be skipped (already processed).
         let old_event = make_recorded_event(3, 3);
         let envelopes = react_recorded_event(&mut state, &mut position, &old_event);
         assert!(
@@ -817,7 +582,6 @@ mod tests {
         assert_eq!(state.events_seen, 0, "state should not change");
         assert_eq!(position, 5, "position should not change");
 
-        // Event at position 5 should be processed (next expected position).
         let current_event = make_recorded_event(5, 5);
         let envelopes = react_recorded_event(&mut state, &mut position, &current_event);
         assert_eq!(
@@ -828,7 +592,6 @@ mod tests {
         assert_eq!(state.events_seen, 1);
         assert_eq!(position, 6, "position should advance");
 
-        // Event at position 10 should also be processed (gap is fine).
         let future_event = make_recorded_event(10, 10);
         let envelopes = react_recorded_event(&mut state, &mut position, &future_event);
         assert_eq!(

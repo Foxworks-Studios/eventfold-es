@@ -2,8 +2,8 @@
 //! projections, and process managers into a single [`AggregateStore`] type.
 //!
 //! The store is opened via [`AggregateStoreBuilder`], which connects to
-//! an `eventfold-db` gRPC server and configures local caches for snapshots,
-//! projection checkpoints, and process manager checkpoints.
+//! an `eventfold-db` gRPC server. All state is rebuilt from the event log
+//! on startup -- there is no local disk caching.
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
@@ -163,8 +163,7 @@ impl AggregateStore {
         let config = ActorConfig {
             idle_timeout: self.idle_timeout,
         };
-        let handle =
-            spawn_actor_with_config::<A>(id, self.client.clone(), &self.base_dir, config).await?;
+        let handle = spawn_actor_with_config::<A>(id, self.client.clone(), config).await?;
 
         let mut cache = self.cache.write().await;
         cache.insert(key, Box::new(handle.clone()));
@@ -337,7 +336,6 @@ impl AggregateStore {
     /// 1. Catch up on the global log, collecting command envelopes.
     /// 2. Dispatch each envelope to the target aggregate via the type registry.
     /// 3. Write failed dispatches to the per-PM dead-letter log.
-    /// 4. Save the process manager checkpoint after all envelopes are handled.
     ///
     /// # Returns
     ///
@@ -346,7 +344,7 @@ impl AggregateStore {
     ///
     /// # Errors
     ///
-    /// Returns `io::Error` if catching up or saving checkpoints fails.
+    /// Returns `io::Error` if catching up fails.
     pub async fn run_process_managers(&self) -> io::Result<ProcessManagerReport> {
         let mut all_work: Vec<(Vec<CommandEnvelope>, PathBuf)> = Vec::new();
 
@@ -395,15 +393,6 @@ impl AggregateStore {
                         report.dead_lettered += 1;
                     }
                 }
-            }
-        }
-
-        // Save all PM checkpoints after dispatch is complete.
-        {
-            let pms = self.process_managers.read().await;
-            for pm_mutex in pms.iter() {
-                let pm = pm_mutex.lock().await;
-                pm.save()?;
             }
         }
 
@@ -570,7 +559,7 @@ impl AggregateStoreBuilder {
         self
     }
 
-    /// Set the local cache directory for snapshots and checkpoints.
+    /// Set the local data directory for dead-letter logs.
     ///
     /// If not set, defaults to a system temp directory.
     ///
@@ -614,8 +603,8 @@ impl AggregateStoreBuilder {
 
     /// Register a projection type to be managed by this store.
     ///
-    /// The projection will be initialized (loading any existing checkpoint)
-    /// when [`open`](AggregateStoreBuilder::open) is called.
+    /// The projection will be initialized when
+    /// [`open`](AggregateStoreBuilder::open) is called.
     ///
     /// # Type Parameters
     ///
@@ -627,11 +616,9 @@ impl AggregateStoreBuilder {
     pub fn projection<P: Projection>(mut self) -> Self {
         self.projection_factories.push((
             P::NAME.to_owned(),
-            Box::new(|client: EsClient, base_dir: &Path| {
-                let checkpoint_dir = base_dir.join("projections").join(P::NAME);
-                let runner = ProjectionRunner::<P>::new(client, checkpoint_dir)?;
+            Box::new(|client: EsClient, _base_dir: &Path| {
                 Ok(tokio::sync::Mutex::new(
-                    Box::new(runner) as Box<dyn ProjectionCatchUp>
+                    Box::new(ProjectionRunner::<P>::new(client)) as Box<dyn ProjectionCatchUp>,
                 ))
             }),
         ));
@@ -640,8 +627,8 @@ impl AggregateStoreBuilder {
 
     /// Register a process manager type to be managed by this store.
     ///
-    /// The process manager will be initialized (loading any existing
-    /// checkpoint) when [`open`](AggregateStoreBuilder::open) is called.
+    /// The process manager will be initialized when
+    /// [`open`](AggregateStoreBuilder::open) is called.
     ///
     /// # Type Parameters
     ///
@@ -657,8 +644,8 @@ impl AggregateStoreBuilder {
         self.process_manager_factories.push((
             PM::NAME.to_owned(),
             Box::new(|client: EsClient, base_dir: &Path| {
-                let checkpoint_dir = base_dir.join("process_managers").join(PM::NAME);
-                let runner = ProcessManagerRunner::<PM>::new(client, checkpoint_dir)?;
+                let data_dir = base_dir.join("process_managers").join(PM::NAME);
+                let runner = ProcessManagerRunner::<PM>::new(client, data_dir);
                 Ok(tokio::sync::Mutex::new(
                     Box::new(runner) as Box<dyn ProcessManagerCatchUp>
                 ))
@@ -669,9 +656,9 @@ impl AggregateStoreBuilder {
 
     /// Set the idle timeout for actor eviction.
     ///
-    /// Actors that receive no messages for this duration will shut down
-    /// and save a snapshot. The next [`get`](AggregateStore::get) call
-    /// transparently re-spawns the actor from snapshot + catch-up.
+    /// Actors that receive no messages for this duration will shut down.
+    /// The next [`get`](AggregateStore::get) call transparently re-spawns
+    /// the actor, replaying from the event log.
     ///
     /// Defaults to 5 minutes.
     ///
@@ -689,8 +676,8 @@ impl AggregateStoreBuilder {
 
     /// Set the live subscription configuration.
     ///
-    /// Controls checkpoint flush frequency and reconnection backoff for the
-    /// live subscription loop started by
+    /// Controls reconnection backoff for the live subscription loop
+    /// started by
     /// [`AggregateStore::start_live`](AggregateStore).
     ///
     /// If not called, [`LiveConfig::default()`] is used.
@@ -710,8 +697,7 @@ impl AggregateStoreBuilder {
     /// Connect to the gRPC server and build the [`AggregateStore`].
     ///
     /// Establishes a gRPC channel to the configured endpoint, initializes
-    /// all registered projections and process managers (loading persisted
-    /// checkpoints if available), and returns the store.
+    /// all registered projections and process managers, and returns the store.
     ///
     /// # Returns
     ///
@@ -741,7 +727,7 @@ impl AggregateStoreBuilder {
                 .map_err(|e| {
                     // tonic::transport::Error is opaque; we cannot construct one
                     // directly. Instead, we log and panic. In practice, this only
-                    // fails on I/O errors reading checkpoint files.
+                    // fails on I/O errors during initialization.
                     tracing::error!(error = %e, "failed to initialize projection '{name}'");
                     e
                 })
@@ -864,9 +850,7 @@ mod tests {
 
         // Create a projection runner and manually apply events to simulate
         // live loop having processed events.
-        let checkpoint_dir = tmp.path().join("projections").join("test-counter");
-        let runner = ProjectionRunner::<TestCounter>::new(client.clone(), checkpoint_dir)
-            .expect("runner creation should succeed");
+        let runner = ProjectionRunner::<TestCounter>::new(client.clone());
         let mut projections = HashMap::new();
         projections.insert(
             "test-counter".to_string(),
@@ -1058,16 +1042,11 @@ mod tests {
         use crate::live::LiveConfig;
 
         let custom = LiveConfig {
-            checkpoint_interval: Duration::from_secs(42),
             reconnect_base_delay: Duration::from_millis(500),
             reconnect_max_delay: Duration::from_secs(60),
         };
         let tmp = tempfile::tempdir().expect("temp dir");
         let store = mock_store_with_live_config(tmp.path(), custom.clone());
-        assert_eq!(
-            store.live_config.checkpoint_interval,
-            Duration::from_secs(42)
-        );
         assert_eq!(
             store.live_config.reconnect_base_delay,
             Duration::from_millis(500)
@@ -1085,10 +1064,6 @@ mod tests {
         let tmp = tempfile::tempdir().expect("temp dir");
         let store = mock_store(tmp.path());
         let default = LiveConfig::default();
-        assert_eq!(
-            store.live_config.checkpoint_interval,
-            default.checkpoint_interval
-        );
         assert_eq!(
             store.live_config.reconnect_base_delay,
             default.reconnect_base_delay

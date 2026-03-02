@@ -26,8 +26,6 @@ pub use event::{
 mod client;
 pub use client::{EsClient, ExpectedVersionArg};
 mod process_manager;
-mod snapshot;
-mod storage;
 pub use process_manager::{ProcessManager, ProcessManagerReport};
 mod live;
 pub use live::{LiveConfig, LiveHandle};

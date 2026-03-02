@@ -6,10 +6,9 @@
 //! [`EventStoreOps`] trait (implemented by [`EsClient`] for production use).
 //!
 //! Public API: [`AggregateHandle`] (cloneable async handle) and
-//! [`spawn_actor_with_config`] (factory that loads a snapshot and starts
-//! the actor task).
+//! [`spawn_actor_with_config`] (factory that replays the full event stream
+//! and starts the actor task).
 
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -23,7 +22,6 @@ use crate::command::CommandContext;
 use crate::error::{ExecuteError, StateError};
 use crate::event::{ProposedEventData, encode_domain_event, stream_uuid};
 use crate::proto::RecordedEvent;
-use crate::snapshot::{Snapshot, load_snapshot, save_snapshot};
 
 /// Maximum number of optimistic concurrency retries before giving up.
 const MAX_RETRIES: u32 = 3;
@@ -307,14 +305,13 @@ struct ActorContext<S> {
     store: S,
     stream_id: Uuid,
     instance_id: String,
-    base_dir: PathBuf,
     config: ActorConfig,
 }
 
 /// Run the actor loop as an async task.
 ///
 /// Processes messages from the channel, executing commands with optimistic
-/// concurrency retries, and saves a snapshot on shutdown.
+/// concurrency retries.
 async fn run_actor<A, S>(
     mut ctx: ActorContext<S>,
     mut state: A,
@@ -384,23 +381,11 @@ async fn run_actor<A, S>(
                 }
 
                 ActorMessage::Shutdown => {
-                    save_snapshot_quietly::<A>(
-                        &ctx.base_dir,
-                        &ctx.instance_id,
-                        &state,
-                        stream_version.unwrap_or(0),
-                    );
                     break;
                 }
             },
             // Channel closed: all senders dropped.
             Ok(None) => {
-                save_snapshot_quietly::<A>(
-                    &ctx.base_dir,
-                    &ctx.instance_id,
-                    &state,
-                    stream_version.unwrap_or(0),
-                );
                 break;
             }
             // Idle timeout elapsed.
@@ -409,36 +394,9 @@ async fn run_actor<A, S>(
                     aggregate_type = A::AGGREGATE_TYPE,
                     "actor idle, shutting down"
                 );
-                save_snapshot_quietly::<A>(
-                    &ctx.base_dir,
-                    &ctx.instance_id,
-                    &state,
-                    stream_version.unwrap_or(0),
-                );
                 break;
             }
         }
-    }
-}
-
-/// Save a snapshot, logging any error but not propagating it.
-fn save_snapshot_quietly<A: Aggregate>(
-    base_dir: &Path,
-    instance_id: &str,
-    state: &A,
-    stream_version: u64,
-) {
-    let snap = Snapshot {
-        state: state.clone(),
-        stream_version,
-    };
-    if let Err(e) = save_snapshot::<A>(base_dir, instance_id, &snap) {
-        tracing::error!(
-            error = %e,
-            aggregate_type = A::AGGREGATE_TYPE,
-            instance_id,
-            "failed to save snapshot on shutdown"
-        );
     }
 }
 
@@ -529,15 +487,13 @@ where
 
 /// Spawn a new aggregate actor with explicit configuration.
 ///
-/// Loads a snapshot from disk (if present), derives the stream UUID,
-/// catches up by reading new events from the server, then starts the
-/// actor loop as a tokio task.
+/// Derives the stream UUID, replays the full event stream from the
+/// server, then starts the actor loop as a tokio task.
 ///
 /// # Arguments
 ///
 /// * `instance_id` - The aggregate instance identifier (e.g. "c-1").
 /// * `client` - The gRPC client for communicating with eventfold-db.
-/// * `base_dir` - Root directory for local snapshot storage.
 /// * `config` - Actor configuration (idle timeout).
 ///
 /// # Returns
@@ -547,18 +503,16 @@ where
 /// # Errors
 ///
 /// Returns [`tonic::Status`] if the catch-up read fails.
-/// Returns [`std::io::Error`] if the snapshot cannot be loaded.
 pub(crate) async fn spawn_actor_with_config<A: Aggregate>(
     instance_id: &str,
     client: crate::client::EsClient,
-    base_dir: &Path,
     config: ActorConfig,
 ) -> Result<AggregateHandle<A>, tonic::Status>
 where
     A::Command: Clone,
     A::DomainEvent: DeserializeOwned,
 {
-    spawn_actor_with_store(instance_id, client, base_dir, config).await
+    spawn_actor_with_store(instance_id, client, config).await
 }
 
 /// Internal spawn helper that is generic over the store implementation.
@@ -568,7 +522,6 @@ where
 async fn spawn_actor_with_store<A, S>(
     instance_id: &str,
     mut store: S,
-    base_dir: &Path,
     config: ActorConfig,
 ) -> Result<AggregateHandle<A>, tonic::Status>
 where
@@ -579,23 +532,11 @@ where
 {
     let stream_id = stream_uuid(A::AGGREGATE_TYPE, instance_id);
 
-    // Load snapshot from disk (cache miss is Ok(None)).
-    let snapshot: Option<Snapshot<A>> = load_snapshot::<A>(base_dir, instance_id)
-        .map_err(|e| tonic::Status::internal(format!("snapshot load error: {e}")))?;
+    // Always replay the full event stream from the beginning.
+    let mut state = A::default();
+    let mut version: Option<u64> = None;
 
-    // Determine starting state and the version to read from.
-    // If a snapshot exists at stream_version N, events 0..=N have been
-    // applied, so catch-up starts at N + 1.
-    // If no snapshot exists, stream_version is None (stream may not exist).
-    let (mut state, mut version, from_version): (A, Option<u64>, u64) = match snapshot {
-        Some(snap) => {
-            let from = snap.stream_version + 1;
-            (snap.state, Some(snap.stream_version), from)
-        }
-        None => (A::default(), None, 0),
-    };
-
-    let events = store.read_stream(stream_id, from_version, u64::MAX).await?;
+    let events = store.read_stream(stream_id, 0, u64::MAX).await?;
     for ev in &events {
         if let Some(domain_event) = decode_domain_event::<A>(ev) {
             state = state.apply(&domain_event);
@@ -609,7 +550,6 @@ where
         store,
         stream_id,
         instance_id: instance_id.to_string(),
-        base_dir: base_dir.to_path_buf(),
         config,
     };
 
@@ -740,15 +680,11 @@ mod tests {
     }
 
     /// Helper to spawn a test actor with a mock store.
-    async fn spawn_test_actor(
-        store: MockStore,
-        base_dir: &Path,
-        instance_id: &str,
-    ) -> AggregateHandle<Counter> {
+    async fn spawn_test_actor(store: MockStore, instance_id: &str) -> AggregateHandle<Counter> {
         let config = ActorConfig {
             idle_timeout: Duration::from_secs(u64::MAX / 2),
         };
-        spawn_actor_with_store::<Counter, MockStore>(instance_id, store, base_dir, config)
+        spawn_actor_with_store::<Counter, MockStore>(instance_id, store, config)
             .await
             .expect("spawn_actor_with_store should succeed")
     }
@@ -757,9 +693,8 @@ mod tests {
 
     #[tokio::test]
     async fn three_precondition_failures_returns_wrong_expected_version() {
-        let tmp = tempfile::tempdir().expect("temp dir");
         let store = MockStore::with_precondition_failures(3);
-        let handle = spawn_test_actor(store, tmp.path(), "c-fail").await;
+        let handle = spawn_test_actor(store, "c-fail").await;
 
         let result = handle
             .execute(CounterCommand::Increment, CommandContext::default())
@@ -771,87 +706,68 @@ mod tests {
         );
     }
 
-    // ---- Test: execute Increment, Shutdown, snapshot saved ----
+    // ---- Test: full replay from scratch on spawn ----
 
     #[tokio::test]
-    async fn execute_then_shutdown_saves_snapshot() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let store = MockStore::new();
-        let config = ActorConfig {
-            idle_timeout: Duration::from_secs(u64::MAX / 2),
-        };
-        let handle =
-            spawn_actor_with_store::<Counter, MockStore>("c-snap", store, tmp.path(), config)
-                .await
-                .expect("spawn should succeed");
-
-        // Execute one Increment command.
-        handle
-            .execute(CounterCommand::Increment, CommandContext::default())
-            .await
-            .expect("execute should succeed");
-
-        // Send Shutdown so the actor saves a snapshot before exiting.
-        handle
-            .sender
-            .send(ActorMessage::Shutdown)
-            .await
-            .expect("send Shutdown should succeed");
-        // Brief sleep to let the actor task process the shutdown.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Load the snapshot and verify.
-        let snap: Option<Snapshot<Counter>> =
-            load_snapshot::<Counter>(tmp.path(), "c-snap").expect("load_snapshot should succeed");
-        let snap = snap.expect("snapshot should exist");
-        assert_eq!(
-            snap.stream_version, 0,
-            "stream_version should be 0 (first event at version 0)"
-        );
-        assert_eq!(
-            snap.state.value, 1,
-            "state.value should be 1 after one Increment"
-        );
-    }
-
-    // ---- Test: pre-existing snapshot + catch-up from server ----
-
-    #[tokio::test]
-    async fn spawn_with_snapshot_catches_up_from_server() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-
-        // Save a pre-existing snapshot at stream_version = 2, value = 2.
-        let snap = Snapshot {
-            state: Counter { value: 2 },
-            stream_version: 2,
-        };
-        save_snapshot::<Counter>(tmp.path(), "c-catchup", &snap)
-            .expect("save_snapshot should succeed");
-
-        // Build a mock with one additional event at version 3 (Incremented).
-        let stream_id = stream_uuid("counter", "c-catchup");
+    async fn spawn_replays_full_stream_from_scratch() {
+        // Seed the mock with 3 Incremented events at versions 0..2.
+        let stream_id = stream_uuid("counter", "c-replay");
         let metadata = serde_json::json!({
             "aggregate_type": "counter",
-            "instance_id": "c-catchup"
+            "instance_id": "c-replay"
         });
-        let extra_event = RecordedEvent {
-            event_id: Uuid::new_v4().to_string(),
-            stream_id: stream_id.to_string(),
-            stream_version: 3,
-            global_position: 3,
-            event_type: "Incremented".to_string(),
-            payload: b"null".to_vec(),
-            metadata: serde_json::to_vec(&metadata).expect("metadata to vec"),
-            recorded_at: 1_700_000_000_000,
-        };
-        let store = MockStore::new().with_events(vec![extra_event]);
-
-        let handle = spawn_test_actor(store, tmp.path(), "c-catchup").await;
+        let events: Vec<RecordedEvent> = (0..3)
+            .map(|v| RecordedEvent {
+                event_id: Uuid::new_v4().to_string(),
+                stream_id: stream_id.to_string(),
+                stream_version: v,
+                global_position: v,
+                event_type: "Incremented".to_string(),
+                payload: b"null".to_vec(),
+                metadata: serde_json::to_vec(&metadata).expect("metadata to vec"),
+                recorded_at: 1_700_000_000_000,
+            })
+            .collect();
+        let store = MockStore::new().with_events(events);
+        let handle = spawn_test_actor(store, "c-replay").await;
 
         let state = handle.state().await.expect("state should succeed");
         assert_eq!(
             state.value, 3,
-            "state.value should be 3 after snapshot(2) + 1 Incremented"
+            "state.value should be 3 after replaying 3 Incremented events"
+        );
+    }
+
+    // ---- Test: empty store produces default state ----
+
+    #[tokio::test]
+    async fn spawn_with_empty_store_returns_default_state() {
+        let store = MockStore::new();
+        let handle = spawn_test_actor(store, "c-empty").await;
+
+        let state = handle.state().await.expect("state should succeed");
+        assert_eq!(state.value, 0, "default Counter has value 0");
+    }
+
+    // ---- Test: idle timeout shuts down without panicking ----
+
+    #[tokio::test]
+    async fn idle_timeout_shuts_down_cleanly() {
+        let store = MockStore::new();
+        let config = ActorConfig {
+            idle_timeout: Duration::from_millis(50),
+        };
+        let handle = spawn_actor_with_store::<Counter, MockStore>("c-idle", store, config)
+            .await
+            .expect("spawn should succeed");
+
+        // Wait for the idle timeout to fire.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // The actor should have shut down; the handle is no longer alive.
+        assert!(
+            !handle.is_alive(),
+            "actor should have shut down after idle timeout"
         );
     }
 }

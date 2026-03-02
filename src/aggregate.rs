@@ -20,9 +20,7 @@ use serde::{Serialize, de::DeserializeOwned};
 /// - [`apply`](Aggregate::apply) must be a pure, total function. It takes ownership of
 ///   the current state and a reference to a domain event, returning the next state.
 ///   Unknown event variants should be ignored for forward compatibility.
-pub trait Aggregate:
-    Default + Clone + Serialize + DeserializeOwned + Send + Sync + 'static
-{
+pub trait Aggregate: Default + Clone + Send + Sync + 'static {
     /// Identifies this aggregate type (e.g. "order"). Used as a directory name.
     const AGGREGATE_TYPE: &'static str;
 
