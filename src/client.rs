@@ -169,7 +169,10 @@ impl EsClient {
         endpoint: &str,
         token: Arc<RwLock<String>>,
     ) -> Result<Self, tonic::transport::Error> {
-        let channel = tonic::transport::Endpoint::from_shared(endpoint.to_string())?
+        // Use `Endpoint::new()` (not `from_shared()`) so that `https://`
+        // URIs auto-configure TLS via the `tls-native-roots` feature.
+        // `from_shared()` bypasses the auto-TLS step.
+        let channel = tonic::transport::Endpoint::new(endpoint.to_string())?
             .connect()
             .await?;
         let interceptor = BearerInterceptor { token };

@@ -14,7 +14,7 @@ autoexamples = true
 
 [features]
 default = []
-tls = ["tonic/tls-native-roots"]
+tls = ["tonic/tls-native-roots", "tonic/tls-ring"]
 
 [lib]
 
